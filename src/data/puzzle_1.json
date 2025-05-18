@@ -1,0 +1,27 @@
+{
+  "matrix_1": [
+    [null,2,null,null,2,null,null,null],
+    [null,null,null,null,null,null,2,null],
+    [null,null,null,"C",2,2,null,2],
+    [null,null,2,null,null,null,null,null],
+    [null,null,null,null,3,3,2,{"value": 10,"circled": true}],
+    [null,null,null,null,null,1,null,null],
+    [null,2,null,null,3,null,null,2],
+    ["A",null,null,null,null,null,null,null],
+    [null,null,null,2,null,null,2,null,null],
+    [null,null,null,3,2,null,null,null]
+  ],
+  "matrix_2": [
+    [null,null,null,null,null,"E",null,null,null],
+    ["F",null,null,null,null,null,null,null,null],
+    [null,null,null,null,null,null,null,null,null],
+    [null,null,null,null,null,null,null,null,null],
+    [null,"F",null,"E",null,null,null,null,null],
+    [null,"F",null,null,null,null,null,null,null],
+    [null,null,null,null,null,null,null,null,null],
+    [null,"E",null,null,null,null,null,null,null],
+    [null,null,null,null,null,null,null,null,null],
+    [null,null,null,null,null,null,null,null,null],
+    [null,null,"F",null,null,"E","F",null,null]
+  ]
+}
