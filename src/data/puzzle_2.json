@@ -1,0 +1,19 @@
+{
+  "matrix_1": [
+    [null, null, null, null, "C", null],
+    [null, 2, null, null, null, null],
+    [null, null, null, null, null, {"value": 11, "circled": true}],
+    ["A", null, null, null, 3, null],
+    [null, null, 2, null, 1, null],
+    [null, 3, null, null, null, null]
+  ],
+  "matrix_2": [
+    [null, null, null, null, "F", null, null],
+    [null, null, null, null, null, null, null],
+    ["E", null, null, null, null, null, null],
+    [null, null, null, null, "E", null, null],
+    ["F", null, null, null, null, null, null],
+    [null, null, null, null, null, null, null],
+    [null, null, null, null, null, null, null]
+  ]
+}
