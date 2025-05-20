@@ -37,6 +37,12 @@ class Area51Solver:
             self.n_r = len(self.matrix_1)       # Number of rows
             self.n_c = len(self.matrix_1[0])    # Number of columns
             
+            # Validate rectangularity (all rows have equal length)
+            if any(len(row) != self.n_c for row in self.matrix_1):
+                raise ValueError("matrix_1 rows must have equal length")
+            if any(len(row) != self.n_c + 1 for row in self.matrix_2):
+                raise ValueError("matrix_2 rows must have equal length")
+            
             # Validate matrix dimensions
             if self.n_r < 1 or self.n_c < 1:
                 raise ValueError("Puzzle dimensions must be at least 1x1")
@@ -72,7 +78,14 @@ class Area51Solver:
                             continue
                         self.K.append((i, j))
                         print(f"Found circled number {cell['value']} at ({i},{j})")
+                        
+                        # Check if circled number might be infeasible
+                        if cell["value"] > self.n_r + self.n_c + 1:
+                            print(f"Warning: Circled number {cell['value']} at ({i},{j}) may be infeasible in {self.n_r}x{self.n_c} grid")
                     elif isinstance(cell, int):
+                        # Validate uncircled numbers (must be 0-3)
+                        if cell < 0 or cell > 3:
+                            raise ValueError(f"Uncircled number at ({i},{j}) has invalid value {cell}; must be 0-3")
                         self.F.append((i, j))
                         print(f"Found uncircled number {cell} at ({i},{j})")
             
@@ -83,9 +96,22 @@ class Area51Solver:
                     if point == "E":  # White dots
                         self.W.append((i, j))
                         print(f"Found white dots at ({i},{j})")
+                        
+                        # Check if white dot is at a boundary or corner where constraints may be infeasible
+                        if i == 0 or i == self.n_r or j == 0 or j == self.n_c:
+                            print(f"Warning: White dot at boundary position ({i},{j}) may have infeasible constraints")
+                            if (i == 0 and j == 0) or (i == 0 and j == self.n_c) or (i == self.n_r and j == 0) or (i == self.n_r and j == self.n_c):
+                                print(f"Warning: White dot at corner position ({i},{j}) may have severely limited constraints")
+                    
                     elif point == "F":  # Black dots
                         self.B.append((i, j))
                         print(f"Found black dots at ({i},{j})")
+                        
+                        # Check if black dot is at a boundary or corner where constraints may be infeasible
+                        if i == 0 or i == self.n_r or j == 0 or j == self.n_c:
+                            print(f"Warning: Black dot at boundary position ({i},{j}) may have infeasible constraints")
+                            if (i == 0 and j == 0) or (i == 0 and j == self.n_c) or (i == self.n_r and j == 0) or (i == self.n_r and j == self.n_c):
+                                print(f"Warning: Black dot at corner position ({i},{j}) may have severely limited constraints")
             
             # Validate that we have at least one alien and one triffid
             if not self.A:
@@ -200,19 +226,8 @@ class Area51Solver:
     
     def _add_constraints(self):
         """Add all constraints to the model."""
-        # Objective: Maximize the number of cells inside the fence to help with visibility
-        self.model += pl.lpSum([self.inside[i, j] for i in range(self.n_r) for j in range(self.n_c)]), "Maximize_Inside_Cells"
-        
-        # Thêm ràng buộc cho các chấm đen/trắng cạnh nhau đầu tiên
-        print("Adding adjacent dots constraints...")
-        self._add_adjacent_dots_constraints()
-        
-        # Kiểm tra tính khả thi sau khi thêm ràng buộc chấm cạnh nhau
-        result = self.model.solve(pl.PULP_CBC_CMD(msg=False))
-        if self.model.status != pl.LpStatusOptimal:
-            print("Model is infeasible after adding adjacent dots constraints!")
-            return
-        print("Model is feasible with adjacent dots constraints.")
+        # Dummy objective: maximize 0 (constraint satisfaction only)
+        self.model += 0, "Dummy_Objective"
         
         # Step 1: Add flow-based constraints to determine inside/outside
         print("Adding inside/outside constraints...")
@@ -342,46 +357,6 @@ class Area51Solver:
             return
         
         print("All constraints added successfully. Model is feasible.")
-    
-    def _add_adjacent_dots_constraints(self):
-        """Thêm ràng buộc đặc biệt cho các chấm đen/trắng nằm cạnh nhau.
-        
-        Nếu hai chấm đen nằm cạnh nhau, đoạn thẳng nằm giữa chúng phải = 0.
-        Tương tự, nếu hai chấm trắng nằm cạnh nhau, đoạn thẳng nằm giữa chúng phải = 0.
-        """
-        print("Đang thêm ràng buộc cho các chấm đen/trắng nằm cạnh nhau...")
-        
-        # Xử lý chấm đen cạnh nhau
-        for i, j in self.B:
-            # Kiểm tra chấm đen bên phải
-            if (i, j+1) in self.B:
-                print(f"Tìm thấy hai chấm đen cạnh nhau: ({i},{j}) và ({i},{j+1})")
-                # Đoạn thẳng ngang giữa hai chấm đen phải = 0
-                if i <= self.n_r and j < self.n_c:
-                    self.model += self.h[i, j] == 0, f"BlackDots_Adjacent_H_{i}_{j}"
-            
-            # Kiểm tra chấm đen bên dưới
-            if (i+1, j) in self.B:
-                print(f"Tìm thấy hai chấm đen cạnh nhau: ({i},{j}) và ({i+1},{j})")
-                # Đoạn thẳng dọc giữa hai chấm đen phải = 0
-                if i < self.n_r and j <= self.n_c:
-                    self.model += self.v[i, j] == 0, f"BlackDots_Adjacent_V_{i}_{j}"
-        
-        # Xử lý chấm trắng cạnh nhau
-        for i, j in self.W:
-            # Kiểm tra chấm trắng bên phải
-            if (i, j+1) in self.W:
-                print(f"Tìm thấy hai chấm trắng cạnh nhau: ({i},{j}) và ({i},{j+1})")
-                # Đoạn thẳng ngang giữa hai chấm trắng phải = 1
-                if i <= self.n_r and j < self.n_c:
-                    self.model += self.h[i, j] == 1, f"WhiteDots_Adjacent_H_{i}_{j}"
-            
-            # Kiểm tra chấm trắng bên dưới
-            if (i+1, j) in self.W:
-                print(f"Tìm thấy hai chấm trắng cạnh nhau: ({i},{j}) và ({i+1},{j})")
-                # Đoạn thẳng dọc giữa hai chấm trắng phải = 1
-                if i < self.n_r and j <= self.n_c:
-                    self.model += self.v[i, j] == 1, f"WhiteDots_Adjacent_V_{i}_{j}"
     
     def _add_uncircled_number_constraints(self):
         """Add constraints for uncircled numbers.
