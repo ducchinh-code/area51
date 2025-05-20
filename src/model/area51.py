@@ -1,907 +1,837 @@
 import json
 import numpy as np
-import gurobipy as gp
-from gurobipy import GRB
-
+import pulp as pl
+import matplotlib.pyplot as plt
+import os
+from typing import List, Dict, Tuple, Set, Optional
 
 class Area51Solver:
-    def __init__(self, puzzle_input):
-        if isinstance(puzzle_input, tuple):
-            # Initialize with grid size
-            self.rows, self.cols = puzzle_input
-            self.matrix_1 = [[None] * self.cols for _ in range(self.rows)]
-            self.matrix_2 = [[None] * (self.cols + 1) for _ in range(self.rows + 1)]
-        else:
-            # Initialize from file
-            self.load_puzzle(puzzle_input)
-            self.rows = len(self.matrix_1)
-            self.cols = len(self.matrix_1[0])
-        self.model = gp.Model("Area51")
+    def __init__(self, puzzle_path: str):
+        """Initialize the Area51 puzzle solver."""
+        self.puzzle_path = puzzle_path
+        self.load_puzzle()
+        self.solution = None
         
-    def load_puzzle(self, puzzle_file):
+    def load_puzzle(self):
+        """Load puzzle data from JSON file."""
         try:
-            with open(puzzle_file, 'r') as f:
-                data = json.load(f)
-                if 'matrix_1' not in data or 'matrix_2' not in data:
-                    raise ValueError("Puzzle file must contain matrix_1 and matrix_2")
-                self.matrix_1 = data['matrix_1']
-                self.matrix_2 = data['matrix_2']
-        except Exception as e:
-            print(f"Error loading puzzle file: {e}")
+            with open(self.puzzle_path, 'r') as file:
+                puzzle_data = json.load(file)
+            
+            # Verify required keys exist
+            if "matrix_1" not in puzzle_data or "matrix_2" not in puzzle_data:
+                raise ValueError("Puzzle data must contain 'matrix_1' and 'matrix_2'")
+            
+            # Process matrix data
+            self.matrix_1 = puzzle_data["matrix_1"]  # Cells matrix
+            self.matrix_2 = puzzle_data["matrix_2"]  # Points matrix
+            
+            # Validate matrix data
+            if not self.matrix_1 or not isinstance(self.matrix_1, list):
+                raise ValueError("matrix_1 must be a non-empty list")
+            if not self.matrix_2 or not isinstance(self.matrix_2, list):
+                raise ValueError("matrix_2 must be a non-empty list")
+            
+            # Set dimensions
+            self.n_r = len(self.matrix_1)       # Number of rows
+            self.n_c = len(self.matrix_1[0])    # Number of columns
+            
+            # Validate matrix dimensions
+            if self.n_r < 1 or self.n_c < 1:
+                raise ValueError("Puzzle dimensions must be at least 1x1")
+            
+            print(f"Puzzle dimensions: {self.n_r} rows x {self.n_c} columns")
+            print(f"Point matrix dimensions: {len(self.matrix_2)} rows x {len(self.matrix_2[0])} columns")
+            
+            # Validate that matrix_2 has the correct dimensions (matrix_1 rows+1 x matrix_1 columns+1)
+            if len(self.matrix_2) != self.n_r + 1 or len(self.matrix_2[0]) != self.n_c + 1:
+                print(f"Warning: matrix_2 dimensions ({len(self.matrix_2)}x{len(self.matrix_2[0])}) don't match expected size ({self.n_r+1}x{self.n_c+1})")
+            
+            # Extract constraint locations
+            self.F = []  # Set of cells with uncircled numbers
+            self.K = []  # Set of cells with circled numbers
+            self.A = []  # Set of cells with aliens
+            self.T = []  # Set of cells with triffids (cactus)
+            self.W = []  # Set of white circles
+            self.B = []  # Set of black circles
+            
+            # Process matrix_1 (cell data)
+            for i in range(self.n_r):
+                for j in range(self.n_c):
+                    cell = self.matrix_1[i][j]
+                    if cell == "A":
+                        self.A.append((i+1, j+1))  # 1-indexed for consistency with constraints
+                        print(f"Found alien at ({i+1},{j+1})")
+                    elif cell == "C":
+                        self.T.append((i+1, j+1))
+                        print(f"Found triffid/cactus at ({i+1},{j+1})")
+                    elif isinstance(cell, dict) and cell.get("circled"):
+                        if "value" not in cell:
+                            print(f"Warning: Circled number at ({i+1},{j+1}) missing 'value' key")
+                            continue
+                        self.K.append((i+1, j+1))
+                        print(f"Found circled number {cell['value']} at ({i+1},{j+1})")
+                    elif isinstance(cell, int):
+                        self.F.append((i+1, j+1))
+                        print(f"Found uncircled number {cell} at ({i+1},{j+1})")
+            
+            # Process matrix_2 (point data)
+            for i in range(len(self.matrix_2)):
+                for j in range(len(self.matrix_2[0])):
+                    point = self.matrix_2[i][j]
+                    if point == "E":  # White circles
+                        self.W.append((i, j))
+                        print(f"Found white circle at ({i},{j})")
+                    elif point == "F":  # Black circles
+                        self.B.append((i, j))
+                        print(f"Found black circle at ({i},{j})")
+            
+            # Validate that we have at least one alien and one triffid
+            if not self.A:
+                print("Warning: No aliens found in puzzle")
+            if not self.T:
+                print("Warning: No triffids found in puzzle")
+            
+        except (IOError, json.JSONDecodeError) as e:
+            print(f"Error loading puzzle: {e}")
             raise
-
-    def create_variables(self):
-        # Create binary variables for fence segments
-        self.h_fence = {}  # Horizontal fence segments
-        self.v_fence = {}  # Vertical fence segments
-        for i in range(self.rows + 1):
-            for j in range(self.cols):
-                self.h_fence[i, j] = self.model.addVar(vtype=GRB.BINARY, name=f'h_{i}_{j}')
-        for i in range(self.rows):
-            for j in range(self.cols + 1):
-                self.v_fence[i, j] = self.model.addVar(vtype=GRB.BINARY, name=f'v_{i}_{j}')
-
-        # Create binary variables for cell containment (inside/outside fence)
-        self.inside = {}
-        for i in range(self.rows):
-            for j in range(self.cols):
-                self.inside[i, j] = self.model.addVar(vtype=GRB.BINARY, name=f'in_{i}_{j}')
-
-        self.model.update()
-
-    def add_constraints(self):
-        self.add_fence_constraints()
-        self.add_inside_outside_constraints()
-        self.add_element_constraints()
-
-    def add_fence_constraints(self):
-        # Each vertex must have 0 or 2 incident edges (degree constraint)
-        for i in range(self.rows + 1):
-            for j in range(self.cols + 1):
-                edges = []
-                if j > 0:
-                    edges.append(self.h_fence[i, j - 1])
-                if j < self.cols:
-                    edges.append(self.h_fence[i, j])
-                if i > 0:
-                    edges.append(self.v_fence[i - 1, j])
-                if i < self.rows:
-                    edges.append(self.v_fence[i, j])
-                
-                if edges:
-                    # Every vertex must have 0 or 2 incident edges (for a valid loop)
-                    # Tối ưu: sử dụng ràng buộc mod-2 trực tiếp thay vì thêm biến k
-                    # self.model.addConstr(gp.quicksum(edges) % 2 == 0, f"degree_{i}_{j}")
-                    # Sửa lại: Gurobi không hỗ trợ toán tử % trực tiếp
-                    k = self.model.addVar(vtype=GRB.INTEGER, lb=0, ub=len(edges) // 2, name=f'k_degree_{i}_{j}')
-                    self.model.addConstr(gp.quicksum(edges) == 2 * k, f"degree_{i}_{j}")
-        
-        # The total number of fence segments must be at least 4 (smallest possible loop)
-        total_fence = gp.quicksum(self.h_fence[i, j] for i in range(self.rows + 1) for j in range(self.cols)) + \
-                      gp.quicksum(self.v_fence[i, j] for i in range(self.rows) for j in range(self.cols + 1))
-        self.model.addConstr(total_fence >= 4, "min_fence_length")
-        
-        # Tối ưu: sử dụng phương pháp hiệu quả hơn cho việc bảo đảm tính liên thông
-        # Thay vì tạo biến dòng chảy cho mỗi cạnh, chúng ta sử dụng các biến chỉ ra thứ tự cạnh
-        # trong chu trình. Điều này giảm đáng kể số lượng ràng buộc và biến.
-        
-        # Tạo biến chỉ ra thứ tự của các cạnh trong chu trình
-        order_h = {}  # Thứ tự của các cạnh ngang
-        order_v = {}  # Thứ tự của các cạnh dọc
-        
-        # Ước tính số cạnh tối đa
-        max_edges = self.rows * self.cols * 2
-        
-        for i in range(self.rows + 1):
-            for j in range(self.cols):
-                # Chỉ tạo biến thứ tự nếu cạnh tồn tại trong hàng rào
-                order_h[i, j] = self.model.addVar(lb=0, ub=max_edges,
-                                              vtype=GRB.INTEGER, name=f'order_h_{i}_{j}')
-                # Thứ tự = 0 nếu cạnh không được sử dụng
-                self.model.addConstr((self.h_fence[i, j] == 0) >> (order_h[i, j] == 0), f"order_h_unused_{i}_{j}")
-                # Thứ tự > 0 nếu cạnh được sử dụng
-                self.model.addConstr((self.h_fence[i, j] == 1) >> (order_h[i, j] >= 1), f"order_h_used_{i}_{j}")
-                self.model.addConstr((self.h_fence[i, j] == 1) >> (order_h[i, j] <= max_edges), f"order_h_max_{i}_{j}")
-        
-        for i in range(self.rows):
-            for j in range(self.cols + 1):
-                # Chỉ tạo biến thứ tự nếu cạnh tồn tại trong hàng rào
-                order_v[i, j] = self.model.addVar(lb=0, ub=max_edges,
-                                              vtype=GRB.INTEGER, name=f'order_v_{i}_{j}')
-                # Thứ tự = 0 nếu cạnh không được sử dụng
-                self.model.addConstr((self.v_fence[i, j] == 0) >> (order_v[i, j] == 0), f"order_v_unused_{i}_{j}")
-                # Thứ tự > 0 nếu cạnh được sử dụng
-                self.model.addConstr((self.v_fence[i, j] == 1) >> (order_v[i, j] >= 1), f"order_v_used_{i}_{j}")
-                self.model.addConstr((self.v_fence[i, j] == 1) >> (order_v[i, j] <= max_edges), f"order_v_max_{i}_{j}")
-        
-        # Đảm bảo thứ tự của các cạnh liên tiếp trên chu trình phải liên tục
-        # Các cạnh liền kề với cùng một đỉnh phải có thứ tự liên tiếp nếu cả hai đều thuộc chu trình
-        for i in range(self.rows + 1):
-            for j in range(self.cols + 1):
-                # Thu thập các cặp cạnh liền kề tại đỉnh này
-                adjacent_pairs = []
-                
-                # Cạnh ngang bên trái và bên phải
-                if j > 0 and j < self.cols:
-                    adjacent_pairs.append((self.h_fence[i, j-1], order_h[i, j-1], self.h_fence[i, j], order_h[i, j]))
-                
-                # Cạnh dọc phía trên và phía dưới
-                if i > 0 and i < self.rows:
-                    adjacent_pairs.append((self.v_fence[i-1, j], order_v[i-1, j], self.v_fence[i, j], order_v[i, j]))
-                
-                # Cạnh ngang bên trái và cạnh dọc phía trên
-                if j > 0 and i > 0:
-                    adjacent_pairs.append((self.h_fence[i, j-1], order_h[i, j-1], self.v_fence[i-1, j], order_v[i-1, j]))
-                
-                # Cạnh ngang bên trái và cạnh dọc phía dưới
-                if j > 0 and i < self.rows:
-                    adjacent_pairs.append((self.h_fence[i, j-1], order_h[i, j-1], self.v_fence[i, j], order_v[i, j]))
-                
-                # Cạnh ngang bên phải và cạnh dọc phía trên
-                if j < self.cols and i > 0:
-                    adjacent_pairs.append((self.h_fence[i, j], order_h[i, j], self.v_fence[i-1, j], order_v[i-1, j]))
-                
-                # Cạnh ngang bên phải và cạnh dọc phía dưới
-                if j < self.cols and i < self.rows:
-                    adjacent_pairs.append((self.h_fence[i, j], order_h[i, j], self.v_fence[i, j], order_v[i, j]))
-                
-                # Thêm ràng buộc cho các cặp cạnh liền kề
-                for edge1, order1, edge2, order2 in adjacent_pairs:
-                    # Nếu cả hai cạnh đều thuộc chu trình, thứ tự của chúng phải liên tiếp
-                    # edge1 * edge2 * (order1 - order2) + (1-edge1) * max_edges + (1-edge2) * max_edges >= 0
-                    # edge1 * edge2 * (order2 - order1) + (1-edge1) * max_edges + (1-edge2) * max_edges >= 0
-                    
-                    # Thêm biến chỉ báo cho biết cả hai cạnh có đều thuộc chu trình không
-                    both_used = self.model.addVar(vtype=GRB.BINARY, name=f'both_used_{edge1.VarName}_{edge2.VarName}')
-                    self.model.addConstr(both_used <= edge1, f"both_used1_{edge1.VarName}_{edge2.VarName}")
-                    self.model.addConstr(both_used <= edge2, f"both_used2_{edge1.VarName}_{edge2.VarName}")
-                    self.model.addConstr(both_used >= edge1 + edge2 - 1, f"both_used3_{edge1.VarName}_{edge2.VarName}")
-                    
-                    # Nếu cả hai cạnh đều thuộc chu trình, thứ tự của chúng chênh lệch 1 hoặc max_edges-1
-                    # (nếu một cạnh là cạnh cuối cùng và cạnh kia là cạnh đầu tiên)
-                    # self.model.addConstr((both_used == 1) >> (
-                    #     (order1 - order2 == 1) | (order2 - order1 == 1) | 
-                    #     (order1 - order2 == max_edges - 1) | (order2 - order1 == max_edges - 1)
-                    # ), f"adjacent_order_{edge1.VarName}_{edge2.VarName}")
-                    
-                    # Sửa lỗi: Gurobi không hỗ trợ toán tử OR (|) trực tiếp cho ràng buộc
-                    # Thay vào đó, sử dụng biến binary cho mỗi trường hợp và OR bằng tổng >= 1
-                    
-                    # Trường hợp 1: order1 - order2 == 1
-                    case1 = self.model.addVar(vtype=GRB.BINARY, name=f'case1_{edge1.VarName}_{edge2.VarName}')
-                    self.model.addConstr((case1 == 1) >> (order1 - order2 == 1), f"case1_{edge1.VarName}_{edge2.VarName}")
-                    
-                    # Trường hợp 2: order2 - order1 == 1
-                    case2 = self.model.addVar(vtype=GRB.BINARY, name=f'case2_{edge1.VarName}_{edge2.VarName}')
-                    self.model.addConstr((case2 == 1) >> (order2 - order1 == 1), f"case2_{edge1.VarName}_{edge2.VarName}")
-                    
-                    # Trường hợp 3: order1 - order2 == max_edges - 1
-                    case3 = self.model.addVar(vtype=GRB.BINARY, name=f'case3_{edge1.VarName}_{edge2.VarName}')
-                    self.model.addConstr((case3 == 1) >> (order1 - order2 == max_edges - 1), f"case3_{edge1.VarName}_{edge2.VarName}")
-                    
-                    # Trường hợp 4: order2 - order1 == max_edges - 1
-                    case4 = self.model.addVar(vtype=GRB.BINARY, name=f'case4_{edge1.VarName}_{edge2.VarName}')
-                    self.model.addConstr((case4 == 1) >> (order2 - order1 == max_edges - 1), f"case4_{edge1.VarName}_{edge2.VarName}")
-                    
-                    # Ít nhất một trong các trường hợp phải đúng
-                    self.model.addConstr((both_used == 1) >> (case1 + case2 + case3 + case4 >= 1), 
-                                         f"adjacent_order_{edge1.VarName}_{edge2.VarName}")
-        
-        # Đảm bảo các giá trị thứ tự đều khác nhau nếu cạnh được sử dụng
-        # Điều này ngăn chặn chu trình nhỏ hơn
-        self.model.update()
-
-    def add_inside_outside_constraints(self):
-        """
-        Add constraints to determine inside/outside regions.
-        
-        A cell is "inside" if a ray from that cell to the boundary crosses
-        an odd number of fence segments. We use ray shooting to the right (East).
-        """
-        for i in range(self.rows):
-            for j in range(self.cols):
-                # Ray shooting to the right (East)
-                # Count fence segments crossed by a ray from cell (i,j) to the right edge
-                crossings = []
-                for k in range(j + 1, self.cols + 1):
-                    crossings.append(self.v_fence[i, k])
-                # Cell is inside if number of crossings is odd
-                # Tối ưu: sử dụng ràng buộc mod-2 trực tiếp thay vì thêm biến k
-                # self.model.addConstr(gp.quicksum(crossings) % 2 == self.inside[i, j], f"inside_{i}_{j}")
-                # Sửa lại: Gurobi không hỗ trợ toán tử % trực tiếp
-                k = self.model.addVar(vtype=GRB.INTEGER, lb=0, ub=self.cols + 1 - j, name=f'k_inside_{i}_{j}')
-                self.model.addConstr(gp.quicksum(crossings) == 2 * k + self.inside[i, j], f"inside_{i}_{j}")
-        
-        # Add connectivity constraints for inside region
-        # At least one cell must be inside
-        total_inside = gp.quicksum(self.inside[i, j] for i in range(self.rows) for j in range(self.cols))
-        self.model.addConstr(total_inside >= 1, "min_inside")
-        
-        # There must be some cells outside as well
-        total_outside = gp.quicksum(1 - self.inside[i, j] for i in range(self.rows) for j in range(self.cols))
-        self.model.addConstr(total_outside >= 1, "min_outside")
-        
-        # Add connectivity constraints: adjacent cells separated by a fence must have different inside/outside status
-        for i in range(self.rows):
-            for j in range(self.cols):
-                # Horizontal fence below this cell
-                if i < self.rows - 1:
-                    # Tối ưu: sử dụng ràng buộc chỉ báo thay vì nhiều biến
-                    # self.model.addConstr(
-                    #     (self.h_fence[i + 1, j] == 1) >> (self.inside[i, j] != self.inside[i + 1, j]),
-                    #     f"h_fence_below_{i}_{j}"
-                    # )
-                    
-                    # Sửa lỗi: Gurobi không hỗ trợ ràng buộc bất đẳng thức (!=)
-                    # Thay thế bằng hai ràng buộc tương đương: 
-                    # nếu h_fence = 1 thì inside1 + inside2 != 1 (tức là inside1 + inside2 = 0 hoặc 2)
-                    self.model.addConstr(
-                        (self.h_fence[i + 1, j] == 1) >> 
-                        (self.inside[i, j] + self.inside[i + 1, j] <= 0 + self.h_fence[i + 1, j]),
-                        f"h_fence_below_{i}_{j}_0"
-                    )
-                    self.model.addConstr(
-                        (self.h_fence[i + 1, j] == 1) >> 
-                        (self.inside[i, j] + self.inside[i + 1, j] >= 2 - self.h_fence[i + 1, j]),
-                        f"h_fence_below_{i}_{j}_2"
-                    )
-                
-                # Vertical fence to the right of this cell
-                if j < self.cols - 1:
-                    # Tối ưu: sử dụng ràng buộc chỉ báo thay vì nhiều biến
-                    # self.model.addConstr(
-                    #     (self.v_fence[i, j + 1] == 1) >> (self.inside[i, j] != self.inside[i, j + 1]),
-                    #     f"v_fence_right_{i}_{j}"
-                    # )
-                    
-                    # Sửa lỗi: Gurobi không hỗ trợ ràng buộc bất đẳng thức (!=)
-                    # Thay thế bằng hai ràng buộc tương đương: 
-                    # nếu v_fence = 1 thì inside1 + inside2 != 1 (tức là inside1 + inside2 = 0 hoặc 2)
-                    self.model.addConstr(
-                        (self.v_fence[i, j + 1] == 1) >> 
-                        (self.inside[i, j] + self.inside[i, j + 1] <= 0 + self.v_fence[i, j + 1]),
-                        f"v_fence_right_{i}_{j}_0"
-                    )
-                    self.model.addConstr(
-                        (self.v_fence[i, j + 1] == 1) >> 
-                        (self.inside[i, j] + self.inside[i, j + 1] >= 2 - self.v_fence[i, j + 1]),
-                        f"v_fence_right_{i}_{j}_2"
-                    )
-
-    def add_element_constraints(self):
-        for i in range(self.rows):
-            for j in range(self.cols):
-                cell_1 = self.matrix_1[i][j]
-                
-                # Handle matrix_1 elements
-                if cell_1 is not None:
-                    if cell_1 == "A":  # Alien must be inside
-                        self.model.addConstr(self.inside[i, j] == 1, f"alien_{i}_{j}")
-                    elif cell_1 == "C":  # Cactus must be outside
-                        self.model.addConstr(self.inside[i, j] == 0, f"cactus_{i}_{j}")
-                    elif isinstance(cell_1, dict) and cell_1.get("circled"):
-                        # Circled number - visibility constraints
-                        value = cell_1["value"]
-                        # Check if the value is reasonable
-                        max_visible = 2 * (self.rows + self.cols) - 3  # Max possible visible cells
-                        if value > max_visible:
-                            print(f"Warning: Circled number at ({i},{j}) is {value}, may be too large (max possible: {max_visible})")
-                        self.add_visibility_constraints(i, j, value)
-                    elif isinstance(cell_1, (int, float)):
-                        # Validate number range (0-3)
-                        if cell_1 < 0 or cell_1 > 3:
-                            print(f"Warning: Uncircled number at ({i},{j}) is {cell_1}, should be between 0-3")
-                        # Uncircled number - count fence segments around the square
-                        self.add_uncircled_number_constraints(i, j, cell_1)
-                
-                # Handle matrix_2 elements (Masyu circles)
-                for di, dj in [(0, 0), (0, 1), (1, 0), (1, 1)]:
-                    if i + di < len(self.matrix_2) and j + dj < len(self.matrix_2[0]):
-                        dot = self.matrix_2[i + di][j + dj]
-                        if dot in ["E", "F"]:
-                            self.add_masyu_constraints(i + di, j + dj, dot)
-
-    def add_visibility_constraints(self, i, j, value):
-        """Add constraints for circled number visibility.
-        A circled number:
-        1. Must be inside the fence
-        2. Counts total visible squares in all 4 directions (N,S,E,W)
-        3. Includes its own square in the count
-        4. A square is visible if it's not blocked by a fence
-        """
-        # First, ensure the circled number is inside the fence
-        self.model.addConstr(self.inside[i, j] == 1, f"circled_inside_{i}_{j}")
-        
-        # Tối ưu: Trực tiếp đếm số lượng ô nhìn thấy thay vì tạo biến cho mỗi ô
-        # Điều này giảm đáng kể số lượng biến và ràng buộc
-        
-        # Số lượng ô nhìn thấy theo hướng Bắc (lên)
-        north_visible = []
-        for r in range(i - 1, -1, -1):
-            # Tạo biến cho vùng nhìn thấy liên tục
-            visible_to_r = self.model.addVar(vtype=GRB.BINARY, name=f'vis_to_N_{r}_{j}')
-            
-            # Nếu có hàng rào ngang giữa ô gốc và ô này, ô này không nhìn thấy được
-            blocking_fences = []
-            for k in range(r, i):
-                blocking_fences.append(self.h_fence[k + 1, j])
-            
-            # Ô nhìn thấy được nếu không có hàng rào nào chặn tầm nhìn
-            self.model.addConstr(visible_to_r <= 1 - gp.quicksum(blocking_fences), f"vis_N_{r}_{j}")
-            
-            # Thêm vào danh sách ô nhìn thấy được
-            north_visible.append(visible_to_r)
-        
-        # Số lượng ô nhìn thấy theo hướng Nam (xuống)
-        south_visible = []
-        for r in range(i + 1, self.rows):
-            # Tạo biến cho vùng nhìn thấy liên tục
-            visible_to_r = self.model.addVar(vtype=GRB.BINARY, name=f'vis_to_S_{r}_{j}')
-            
-            # Nếu có hàng rào ngang giữa ô gốc và ô này, ô này không nhìn thấy được
-            blocking_fences = []
-            for k in range(i, r):
-                blocking_fences.append(self.h_fence[k + 1, j])
-            
-            # Ô nhìn thấy được nếu không có hàng rào nào chặn tầm nhìn
-            self.model.addConstr(visible_to_r <= 1 - gp.quicksum(blocking_fences), f"vis_S_{r}_{j}")
-            
-            # Thêm vào danh sách ô nhìn thấy được
-            south_visible.append(visible_to_r)
-        
-        # Số lượng ô nhìn thấy theo hướng Đông (phải)
-        east_visible = []
-        for c in range(j + 1, self.cols):
-            # Tạo biến cho vùng nhìn thấy liên tục
-            visible_to_c = self.model.addVar(vtype=GRB.BINARY, name=f'vis_to_E_{i}_{c}')
-            
-            # Nếu có hàng rào dọc giữa ô gốc và ô này, ô này không nhìn thấy được
-            blocking_fences = []
-            for k in range(j, c):
-                blocking_fences.append(self.v_fence[i, k + 1])
-            
-            # Ô nhìn thấy được nếu không có hàng rào nào chặn tầm nhìn
-            self.model.addConstr(visible_to_c <= 1 - gp.quicksum(blocking_fences), f"vis_E_{i}_{c}")
-            
-            # Thêm vào danh sách ô nhìn thấy được
-            east_visible.append(visible_to_c)
-        
-        # Số lượng ô nhìn thấy theo hướng Tây (trái)
-        west_visible = []
-        for c in range(j - 1, -1, -1):
-            # Tạo biến cho vùng nhìn thấy liên tục
-            visible_to_c = self.model.addVar(vtype=GRB.BINARY, name=f'vis_to_W_{i}_{c}')
-            
-            # Nếu có hàng rào dọc giữa ô gốc và ô này, ô này không nhìn thấy được
-            blocking_fences = []
-            for k in range(c, j):
-                blocking_fences.append(self.v_fence[i, k + 1])
-            
-            # Ô nhìn thấy được nếu không có hàng rào nào chặn tầm nhìn
-            self.model.addConstr(visible_to_c <= 1 - gp.quicksum(blocking_fences), f"vis_W_{i}_{c}")
-            
-            # Thêm vào danh sách ô nhìn thấy được
-            west_visible.append(visible_to_c)
-        
-        # Tổng số ô nhìn thấy được phải bằng giá trị của số được khoanh tròn
-        # Ô ban đầu (i,j) luôn nhìn thấy được
-        all_visible = north_visible + south_visible + east_visible + west_visible
-        self.model.addConstr(gp.quicksum(all_visible) + 1 == value, f"total_visible_{i}_{j}")
-
-    def add_masyu_constraints(self, i, j, dot_type):
-        """Add constraints for Masyu black and white circles
-        
-        Rules:
-        - Black circle (F): The fence must make a turn at the circle, and must go
-          straight through the next cell in both directions.
-        - White circle (E): The fence must go straight through the circle, and must
-          make a turn at at least one of the adjacent cells.
-        """
-        # Get all possible fence segments that can go through this vertex
-        h_left = None if j == 0 else self.h_fence[i, j - 1]
-        h_right = None if j >= self.cols else self.h_fence[i, j]
-        v_up = None if i == 0 else self.v_fence[i - 1, j]
-        v_down = None if i >= self.rows else self.v_fence[i, j]
-
-        # Collect valid fence segments
-        fence_edges = []
-        if h_left is not None:
-            fence_edges.append(h_left)
-        if h_right is not None:
-            fence_edges.append(h_right)
-        if v_up is not None:
-            fence_edges.append(v_up)
-        if v_down is not None:
-            fence_edges.append(v_down)
-        
-        # Fence must pass through the vertex with exactly 2 edges
-        if fence_edges:
-            self.model.addConstr(gp.quicksum(fence_edges) == 2, f"masyu_pass_{i}_{j}")
-        
-        # Tối ưu: Xử lý horiz_pass và vert_pass theo cách khác để giảm số biến
-        if dot_type == "F":  # Black circle
-            # Black circle must make a turn
-            # Tối ưu: Thay vì tạo các biến trung gian, sử dụng ràng buộc trực tiếp
-            # Không thể có hai cạnh ngang hoặc hai cạnh dọc cùng được sử dụng
-            if h_left is not None and h_right is not None:
-                self.model.addConstr(h_left + h_right <= 1, f"black_no_horiz_{i}_{j}")
-            if v_up is not None and v_down is not None:
-                self.model.addConstr(v_up + v_down <= 1, f"black_no_vert_{i}_{j}")
-
-            # Tối ưu: Xác định các cặp tạo góc và thêm các ràng buộc thẳng hàng trực tiếp
-            turns = []
-            
-            # Left-Up turn
-            if h_left is not None and v_up is not None:
-                left_up_turn = self.model.addVar(vtype=GRB.BINARY, name=f'left_up_turn_{i}_{j}')
-                self.model.addConstr(left_up_turn <= h_left, f"left_up_h_{i}_{j}")
-                self.model.addConstr(left_up_turn <= v_up, f"left_up_v_{i}_{j}")
-                self.model.addConstr(left_up_turn >= h_left + v_up - 1, f"left_up_used_{i}_{j}")
-                turns.append(left_up_turn)
-                
-                # Thêm điều kiện thẳng hàng nếu góc này được sử dụng
-                if j > 1:  # Có thể mở rộng sang trái hai ô
-                    self.model.addConstr((left_up_turn == 1) >> (self.h_fence[i, j-1] == 1), f"black_left_extend1_{i}_{j}")
-                    self.model.addConstr((left_up_turn == 1) >> (self.h_fence[i, j-2] == 1), f"black_left_extend2_{i}_{j}")
-                
-                if i > 1:  # Có thể mở rộng lên trên hai ô
-                    self.model.addConstr((left_up_turn == 1) >> (self.v_fence[i-1, j] == 1), f"black_up_extend1_{i}_{j}")
-                    self.model.addConstr((left_up_turn == 1) >> (self.v_fence[i-2, j] == 1), f"black_up_extend2_{i}_{j}")
-            
-            # Left-Down turn
-            if h_left is not None and v_down is not None:
-                left_down_turn = self.model.addVar(vtype=GRB.BINARY, name=f'left_down_turn_{i}_{j}')
-                self.model.addConstr(left_down_turn <= h_left, f"left_down_h_{i}_{j}")
-                self.model.addConstr(left_down_turn <= v_down, f"left_down_v_{i}_{j}")
-                self.model.addConstr(left_down_turn >= h_left + v_down - 1, f"left_down_used_{i}_{j}")
-                turns.append(left_down_turn)
-                
-                # Thêm điều kiện thẳng hàng nếu góc này được sử dụng
-                if j > 1:  # Có thể mở rộng sang trái hai ô
-                    self.model.addConstr((left_down_turn == 1) >> (self.h_fence[i, j-1] == 1), f"black_left_extend1_2_{i}_{j}")
-                    self.model.addConstr((left_down_turn == 1) >> (self.h_fence[i, j-2] == 1), f"black_left_extend2_2_{i}_{j}")
-                
-                if i < self.rows - 2:  # Có thể mở rộng xuống dưới hai ô
-                    self.model.addConstr((left_down_turn == 1) >> (self.v_fence[i+1, j] == 1), f"black_down_extend1_{i}_{j}")
-                    self.model.addConstr((left_down_turn == 1) >> (self.v_fence[i+2, j] == 1), f"black_down_extend2_{i}_{j}")
-            
-            # Right-Up turn
-            if h_right is not None and v_up is not None:
-                right_up_turn = self.model.addVar(vtype=GRB.BINARY, name=f'right_up_turn_{i}_{j}')
-                self.model.addConstr(right_up_turn <= h_right, f"right_up_h_{i}_{j}")
-                self.model.addConstr(right_up_turn <= v_up, f"right_up_v_{i}_{j}")
-                self.model.addConstr(right_up_turn >= h_right + v_up - 1, f"right_up_used_{i}_{j}")
-                turns.append(right_up_turn)
-                
-                # Thêm điều kiện thẳng hàng nếu góc này được sử dụng
-                if j < self.cols - 2:  # Có thể mở rộng sang phải hai ô
-                    self.model.addConstr((right_up_turn == 1) >> (self.h_fence[i, j+1] == 1), f"black_right_extend1_{i}_{j}")
-                    self.model.addConstr((right_up_turn == 1) >> (self.h_fence[i, j+2] == 1), f"black_right_extend2_{i}_{j}")
-                
-                if i > 1:  # Có thể mở rộng lên trên hai ô
-                    self.model.addConstr((right_up_turn == 1) >> (self.v_fence[i-1, j] == 1), f"black_up_extend1_2_{i}_{j}")
-                    self.model.addConstr((right_up_turn == 1) >> (self.v_fence[i-2, j] == 1), f"black_up_extend2_2_{i}_{j}")
-            
-            # Right-Down turn
-            if h_right is not None and v_down is not None:
-                right_down_turn = self.model.addVar(vtype=GRB.BINARY, name=f'right_down_turn_{i}_{j}')
-                self.model.addConstr(right_down_turn <= h_right, f"right_down_h_{i}_{j}")
-                self.model.addConstr(right_down_turn <= v_down, f"right_down_v_{i}_{j}")
-                self.model.addConstr(right_down_turn >= h_right + v_down - 1, f"right_down_used_{i}_{j}")
-                turns.append(right_down_turn)
-                
-                # Thêm điều kiện thẳng hàng nếu góc này được sử dụng
-                if j < self.cols - 2:  # Có thể mở rộng sang phải hai ô
-                    self.model.addConstr((right_down_turn == 1) >> (self.h_fence[i, j+1] == 1), f"black_right_extend1_2_{i}_{j}")
-                    self.model.addConstr((right_down_turn == 1) >> (self.h_fence[i, j+2] == 1), f"black_right_extend2_2_{i}_{j}")
-                
-                if i < self.rows - 2:  # Có thể mở rộng xuống dưới hai ô
-                    self.model.addConstr((right_down_turn == 1) >> (self.v_fence[i+1, j] == 1), f"black_down_extend1_2_{i}_{j}")
-                    self.model.addConstr((right_down_turn == 1) >> (self.v_fence[i+2, j] == 1), f"black_down_extend2_2_{i}_{j}")
-            
-            # Một góc phải được sử dụng
-            if turns:
-                self.model.addConstr(gp.quicksum(turns) == 1, f"black_one_turn_{i}_{j}")
-
-        else:  # White circle (E)
-            # Tối ưu: Cách tiếp cận trực tiếp hơn cho vòng tròn trắng
-            # White circle must have straight passing - horizontal or vertical
-            horiz_pass = vert_pass = None
-            
-            if h_left is not None and h_right is not None:
-                horiz_pass = self.model.addVar(vtype=GRB.BINARY, name=f'horiz_pass_{i}_{j}')
-                self.model.addConstr((horiz_pass == 1) >> (h_left == 1), f"horiz_left_{i}_{j}")
-                self.model.addConstr((horiz_pass == 1) >> (h_right == 1), f"horiz_right_{i}_{j}")
-                self.model.addConstr(horiz_pass >= h_left + h_right - 1, f"horiz_both_{i}_{j}")
-            
-            if v_up is not None and v_down is not None:
-                vert_pass = self.model.addVar(vtype=GRB.BINARY, name=f'vert_pass_{i}_{j}')
-                self.model.addConstr((vert_pass == 1) >> (v_up == 1), f"vert_up_{i}_{j}")
-                self.model.addConstr((vert_pass == 1) >> (v_down == 1), f"vert_down_{i}_{j}")
-                self.model.addConstr(vert_pass >= v_up + v_down - 1, f"vert_both_{i}_{j}")
-            
-            # Phải đi thẳng qua (hoặc ngang hoặc dọc)
-            if horiz_pass is not None and vert_pass is not None:
-                self.model.addConstr(horiz_pass + vert_pass == 1, f"white_straight_{i}_{j}")
-            elif horiz_pass is not None:
-                self.model.addConstr(horiz_pass == 1, f"white_horiz_{i}_{j}")
-            elif vert_pass is not None:
-                self.model.addConstr(vert_pass == 1, f"white_vert_{i}_{j}")
-            
-            # Tạo các biến cho các góc rẽ ở các ô liền kề và tối ưu ràng buộc
-            # Tối ưu: Giảm số lượng biến bằng cách sử dụng cấu trúc khác
-            
-            # Tạo biến chỉ báo có ít nhất một góc rẽ ở các ô liền kề
-            has_adjacent_turn = self.model.addVar(vtype=GRB.BINARY, name=f'has_adj_turn_{i}_{j}')
-            
-            # Danh sách các góc rẽ tiềm năng cho từng hướng
-            adjacent_turns = []
-            
-            # Kiểm tra góc rẽ ở các ô liền kề khi đi ngang
-            if horiz_pass is not None:
-                # Vertex bên trái
-                if j > 0:
-                    # Góc rẽ xuống ở bên trái
-                    if i < self.rows - 1 and j > 0:
-                        left_down_turn = self.model.addVar(vtype=GRB.BINARY, name=f'adj_left_down_{i}_{j}')
-                        # Góc này chỉ tồn tại nếu đi ngang qua vòng tròn trắng
-                        self.model.addConstr(left_down_turn <= horiz_pass, f"adj_left_down_enable_{i}_{j}")
-                        # Các cạnh tạo góc phải tồn tại
-                        self.model.addConstr(left_down_turn <= self.v_fence[i, j-1], f"adj_left_down_v_{i}_{j}")
-                        self.model.addConstr(left_down_turn <= self.h_fence[i+1, j-1], f"adj_left_down_h_{i}_{j}")
-                        # Nếu cả hai cạnh tồn tại thì có góc rẽ
-                        self.model.addConstr(left_down_turn >= self.v_fence[i, j-1] + self.h_fence[i+1, j-1] + horiz_pass - 2, f"adj_left_down_exist_{i}_{j}")
-                        adjacent_turns.append(left_down_turn)
-                    
-                    # Góc rẽ lên ở bên trái
-                    if i > 0 and j > 0:
-                        left_up_turn = self.model.addVar(vtype=GRB.BINARY, name=f'adj_left_up_{i}_{j}')
-                        # Tối ưu: thêm ràng buộc tương tự
-                        self.model.addConstr(left_up_turn <= horiz_pass, f"adj_left_up_enable_{i}_{j}")
-                        self.model.addConstr(left_up_turn <= self.v_fence[i-1, j-1], f"adj_left_up_v_{i}_{j}")
-                        self.model.addConstr(left_up_turn <= self.h_fence[i, j-1], f"adj_left_up_h_{i}_{j}")
-                        self.model.addConstr(left_up_turn >= self.v_fence[i-1, j-1] + self.h_fence[i, j-1] + horiz_pass - 2, f"adj_left_up_exist_{i}_{j}")
-                        adjacent_turns.append(left_up_turn)
-                
-                # Vertex bên phải
-                if j < self.cols - 1:
-                    # Góc rẽ xuống ở bên phải
-                    if i < self.rows - 1 and j < self.cols - 1:
-                        right_down_turn = self.model.addVar(vtype=GRB.BINARY, name=f'adj_right_down_{i}_{j}')
-                        # Tối ưu: thêm ràng buộc tương tự
-                        self.model.addConstr(right_down_turn <= horiz_pass, f"adj_right_down_enable_{i}_{j}")
-                        self.model.addConstr(right_down_turn <= self.v_fence[i, j+1], f"adj_right_down_v_{i}_{j}")
-                        self.model.addConstr(right_down_turn <= self.h_fence[i+1, j+1], f"adj_right_down_h_{i}_{j}")
-                        self.model.addConstr(right_down_turn >= self.v_fence[i, j+1] + self.h_fence[i+1, j+1] + horiz_pass - 2, f"adj_right_down_exist_{i}_{j}")
-                        adjacent_turns.append(right_down_turn)
-                    
-                    # Góc rẽ lên ở bên phải
-                    if i > 0 and j < self.cols - 1:
-                        right_up_turn = self.model.addVar(vtype=GRB.BINARY, name=f'adj_right_up_{i}_{j}')
-                        # Tối ưu: thêm ràng buộc tương tự
-                        self.model.addConstr(right_up_turn <= horiz_pass, f"adj_right_up_enable_{i}_{j}")
-                        self.model.addConstr(right_up_turn <= self.v_fence[i-1, j+1], f"adj_right_up_v_{i}_{j}")
-                        self.model.addConstr(right_up_turn <= self.h_fence[i, j+1], f"adj_right_up_h_{i}_{j}")
-                        self.model.addConstr(right_up_turn >= self.v_fence[i-1, j+1] + self.h_fence[i, j+1] + horiz_pass - 2, f"adj_right_up_exist_{i}_{j}")
-                        adjacent_turns.append(right_up_turn)
-            
-            # Kiểm tra góc rẽ ở các ô liền kề khi đi dọc
-            if vert_pass is not None:
-                # Tương tự cho các góc rẽ khi đi dọc
-                # Vertex phía trên
-                if i > 0:
-                    # Góc rẽ sang trái ở trên
-                    if j > 0 and i > 0:
-                        up_left_turn = self.model.addVar(vtype=GRB.BINARY, name=f'adj_up_left_{i}_{j}')
-                        self.model.addConstr(up_left_turn <= vert_pass, f"adj_up_left_enable_{i}_{j}")
-                        self.model.addConstr(up_left_turn <= self.h_fence[i-1, j-1], f"adj_up_left_h_{i}_{j}")
-                        self.model.addConstr(up_left_turn <= self.v_fence[i-1, j], f"adj_up_left_v_{i}_{j}")
-                        self.model.addConstr(up_left_turn >= self.h_fence[i-1, j-1] + self.v_fence[i-1, j] + vert_pass - 2, f"adj_up_left_exist_{i}_{j}")
-                        adjacent_turns.append(up_left_turn)
-                    
-                    # Góc rẽ sang phải ở trên
-                    if j < self.cols - 1 and i > 0:
-                        up_right_turn = self.model.addVar(vtype=GRB.BINARY, name=f'adj_up_right_{i}_{j}')
-                        self.model.addConstr(up_right_turn <= vert_pass, f"adj_up_right_enable_{i}_{j}")
-                        self.model.addConstr(up_right_turn <= self.h_fence[i-1, j], f"adj_up_right_h_{i}_{j}")
-                        self.model.addConstr(up_right_turn <= self.v_fence[i-1, j], f"adj_up_right_v_{i}_{j}")
-                        self.model.addConstr(up_right_turn >= self.h_fence[i-1, j] + self.v_fence[i-1, j] + vert_pass - 2, f"adj_up_right_exist_{i}_{j}")
-                        adjacent_turns.append(up_right_turn)
-                
-                # Vertex phía dưới
-                if i < self.rows - 1:
-                    # Góc rẽ sang trái ở dưới
-                    if j > 0 and i < self.rows - 1:
-                        down_left_turn = self.model.addVar(vtype=GRB.BINARY, name=f'adj_down_left_{i}_{j}')
-                        self.model.addConstr(down_left_turn <= vert_pass, f"adj_down_left_enable_{i}_{j}")
-                        self.model.addConstr(down_left_turn <= self.h_fence[i+1, j-1], f"adj_down_left_h_{i}_{j}")
-                        self.model.addConstr(down_left_turn <= self.v_fence[i, j], f"adj_down_left_v_{i}_{j}")
-                        self.model.addConstr(down_left_turn >= self.h_fence[i+1, j-1] + self.v_fence[i, j] + vert_pass - 2, f"adj_down_left_exist_{i}_{j}")
-                        adjacent_turns.append(down_left_turn)
-                    
-                    # Góc rẽ sang phải ở dưới
-                    if j < self.cols - 1 and i < self.rows - 1:
-                        down_right_turn = self.model.addVar(vtype=GRB.BINARY, name=f'adj_down_right_{i}_{j}')
-                        self.model.addConstr(down_right_turn <= vert_pass, f"adj_down_right_enable_{i}_{j}")
-                        self.model.addConstr(down_right_turn <= self.h_fence[i+1, j], f"adj_down_right_h_{i}_{j}")
-                        self.model.addConstr(down_right_turn <= self.v_fence[i, j], f"adj_down_right_v_{i}_{j}")
-                        self.model.addConstr(down_right_turn >= self.h_fence[i+1, j] + self.v_fence[i, j] + vert_pass - 2, f"adj_down_right_exist_{i}_{j}")
-                        adjacent_turns.append(down_right_turn)
-            
-            # Ít nhất một góc rẽ phải tồn tại ở các ô liền kề
-            if adjacent_turns:
-                self.model.addConstr(gp.quicksum(adjacent_turns) >= 1, f"white_adj_turn_{i}_{j}")
-
-    def add_uncircled_number_constraints(self, i, j, value):
-        """Add constraints for uncircled numbers
-        
-        Uncircled numbers indicate how many fence segments are used around the cell.
-        The number ranges from 0 to 3 (not 4, as per the problem statement).
-        """
-        # Count the fence segments around this cell
-        fence_segments = []
-        
-        # Top fence
-        fence_segments.append(self.h_fence[i-1, j-1])
-        
-        # Bottom fence
-        fence_segments.append(self.h_fence[i , j-1])
-        
-        # Left fence
-        fence_segments.append(self.v_fence[i-1, j-1])
-        
-        # Right fence
-        fence_segments.append(self.v_fence[i-1, j])
-        
-        # The total number of fence segments must equal the given value
-        # Validate that the value is between 0 and 3 as per the requirements
-        if value < 0 or value > 3:
-            raise ValueError(f"Uncircled number value must be between 0 and 3, got {value}")
-            
-        self.model.addConstr(gp.quicksum(fence_segments) == value, f"uncircled_{i}_{j}")
-
-    def solve(self, time_limit=None, output_file=None):
-        """Solve the Area51 puzzle
-        
-        Args:
-            time_limit: Maximum time to spend solving (in seconds)
-            output_file: Optional file to save the solution to
-            
-        Returns:
-            A dictionary with the solution status and solution (if found)
-        """
-        try:
-            # Set time limit if specified
-            if time_limit is not None:
-                self.model.Params.TimeLimit = time_limit
-                
-            # Enable presolve to speed up solving
-            self.model.Params.Presolve = 2
-            
-            # Create all variables
-            self.create_variables()
-            
-            # Add all constraints
-            self.add_constraints()
-            
-            # Solve the model
-            self.model.optimize()
-            
-            # Check solution status
-            solution = {
-                "status": self.model.Status
-            }
-            
-            if self.model.Status == GRB.OPTIMAL:
-                solution["status_str"] = "OPTIMAL"
-                solution["objective"] = self.model.ObjVal
-                
-                # Extract fence solution
-                h_fence_sol = {}
-                for i in range(self.rows + 1):
-                    for j in range(self.cols):
-                        if self.h_fence[i, j].X > 0.5:
-                            h_fence_sol[f"{i},{j}"] = 1
-                
-                v_fence_sol = {}
-                for i in range(self.rows):
-                    for j in range(self.cols + 1):
-                        if self.v_fence[i, j].X > 0.5:
-                            v_fence_sol[f"{i},{j}"] = 1
-                
-                # Extract inside/outside regions
-                inside_sol = {}
-                for i in range(self.rows):
-                    for j in range(self.cols):
-                        if self.inside[i, j].X > 0.5:
-                            inside_sol[f"{i},{j}"] = 1
-                
-                solution["h_fence"] = h_fence_sol
-                solution["v_fence"] = v_fence_sol
-                solution["inside"] = inside_sol
-                
-                # Save solution to file if requested
-                if output_file:
-                    with open(output_file, 'w') as f:
-                        json.dump(solution, f, indent=2)
-                
-                return solution
-            
-            elif self.model.Status == GRB.INFEASIBLE:
-                solution["status_str"] = "INFEASIBLE"
-                print("Model is infeasible")
-                
-                # Try to get infeasibility analysis
-                try:
-                    self.model.computeIIS()
-                    solution["iis_constraints"] = []
-                    for c in self.model.getConstrs():
-                        if c.IISConstr:
-                            solution["iis_constraints"].append(c.ConstrName)
-                    print(f"Number of constraints in IIS: {len(solution['iis_constraints'])}")
-                except Exception as e:
-                    print(f"Error computing IIS: {e}")
-                
-                # Try to find a relaxed solution
-                try:
-                    # Create a new model for relaxation
-                    relaxation = self.model.copy()
-                    relaxation.update()
-                    
-                    # Add slack variables to all constraints
-                    slacks = {}
-                    for c in relaxation.getConstrs():
-                        # Skip certain constraints if needed
-                        name = c.ConstrName
-                        # Add slack variable
-                        slack = relaxation.addVar(name=f"slack_{name}", obj=1.0)
-                        slacks[name] = slack
-                    
-                    # Modify constraints with slack variables
-                    for c in relaxation.getConstrs():
-                        name = c.ConstrName
-                        slack = slacks[name]
-                        expr = relaxation.getRow(c)
-                        sense = c.Sense
-                        rhs = c.RHS
-                        
-                        # Remove original constraint
-                        relaxation.remove(c)
-                        
-                        # Add new constraint with slack
-                        if sense == '=':
-                            relaxation.addConstr(expr + slack - slack == rhs, name)
-                        elif sense == '<':
-                            relaxation.addConstr(expr <= rhs + slack, name)
-                        elif sense == '>':
-                            relaxation.addConstr(expr >= rhs - slack, name)
-                    
-                    # Solve relaxed model
-                    relaxation.optimize()
-                    
-                    if relaxation.Status == GRB.OPTIMAL:
-                        print("Found a relaxed solution")
-                        solution["relaxed_status"] = "OPTIMAL"
-                        
-                        # Identify violated constraints
-                        violated = []
-                        for name, var in slacks.items():
-                            if var.X > 1e-6:
-                                violated.append(name)
-                        solution["violated_constraints"] = violated
-                        print(f"Number of violated constraints: {len(violated)}")
-                    else:
-                        print(f"Relaxation status: {relaxation.Status}")
-                        solution["relaxed_status"] = relaxation.Status
-                except Exception as e:
-                    print(f"Error in relaxation: {e}")
-                
-                return solution
-            
-            else:
-                solution["status_str"] = f"OTHER ({self.model.Status})"
-                print(f"Solver status: {self.model.Status}")
-                return solution
-                
         except Exception as e:
-            print(f"Error solving model: {e}")
-            return {"status": "ERROR", "message": str(e)}
-
-    def display_solution(self, solution=None):
-        """Display the solution in a readable format
+            print(f"Error processing puzzle data: {e}")
+            raise
+    
+    def solve(self):
+        """Solve the Area51 puzzle."""
+        # Initialize model
+        self.model = pl.LpProblem("Area51_Fence_Puzzle", pl.LpMinimize)
         
-        Args:
-            solution: Optional solution dictionary. If not provided, the method 
-                     will use the current model solution (assumes model was solved).
-        """
-        if solution is None and self.model.Status != GRB.OPTIMAL:
-            print("No solution to display!")
+        # Initialize decision variables
+        self._init_variables()
+        
+        # Add constraints
+        self._add_constraints()
+        
+        print(f"Model has {len(self.model.constraints)} constraints")
+        print(f"Model has {self.model.numVariables()} variables")
+        
+        # Solve iteratively to ensure single loop
+        iterations = 0
+        max_iterations = 100  # Prevent infinite loops
+        
+        while iterations < max_iterations:
+            # Solve the model
+            self.model.solve(pl.PULP_CBC_CMD(msg=True))
+            
+            # Check if we have a valid solution
+            if self.model.status != pl.LpStatusOptimal:
+                print(f"Solver status: {pl.LpStatus[self.model.status]}")
+                return False
+            
+            # Extract current solution
+            h_sol = {(i, j): pl.value(self.h[i, j]) for i in range(self.n_r+1) for j in range(self.n_c)}
+            v_sol = {(i, j): pl.value(self.v[i, j]) for i in range(self.n_r) for j in range(self.n_c+1)}
+            
+            # Find loops in current solution
+            loops = self._find_loops(h_sol, v_sol)
+            
+            print(f"Found {len(loops)} loops in iteration {iterations+1}")
+            
+            if len(loops) == 1:
+                # We have found a valid solution with a single loop
+                print(f"Solution found after {iterations+1} iterations.")
+                self.solution = {"h": h_sol, "v": v_sol}
+                return True
+            
+            # Add constraints to eliminate multiple loops
+            for loop_idx, loop in enumerate(loops):
+                h_loop = []
+                v_loop = []
+                
+                # Separate horizontal and vertical segments
+                for i in range(len(loop)-1):
+                    curr = loop[i]
+                    next_node = loop[i+1]
+                    
+                    # Check if segment is horizontal or vertical
+                    if curr[0] == next_node[0]:  # Horizontal
+                        if curr[1] < next_node[1]:
+                            h_loop.append((curr[0], curr[1]))
+                        else:
+                            h_loop.append((curr[0], next_node[1]))
+                    else:  # Vertical
+                        if curr[0] < next_node[0]:
+                            v_loop.append((curr[0], curr[1]))
+                        else:
+                            v_loop.append((next_node[0], curr[1]))
+                
+                # Add constraint to prevent this loop
+                if h_loop or v_loop:
+                    print(f"Adding constraint to eliminate loop {loop_idx+1} with {len(h_loop)} horizontal and {len(v_loop)} vertical segments")
+                    self.model += (
+                        pl.lpSum(self.h[i, j] for i, j in h_loop) + 
+                        pl.lpSum(self.v[i, j] for i, j in v_loop) <= 
+                        len(h_loop) + len(v_loop) - 1
+                    )
+            
+            iterations += 1
+        
+        print(f"Maximum iterations ({max_iterations}) reached without finding a valid solution.")
+        return False
+    
+    def _init_variables(self):
+        """Initialize decision variables."""
+        # Horizontal fence segments
+        self.h = {}
+        for i in range(self.n_r+1):
+            for j in range(self.n_c):
+                self.h[i, j] = pl.LpVariable(f"h_{i}_{j}", 0, 1, pl.LpBinary)
+        
+        # Vertical fence segments
+        self.v = {}
+        for i in range(self.n_r):
+            for j in range(self.n_c+1):
+                self.v[i, j] = pl.LpVariable(f"v_{i}_{j}", 0, 1, pl.LpBinary)
+        
+        # Points on the fence
+        self.p = {}
+        for i in range(self.n_r+1):
+            for j in range(self.n_c+1):
+                self.p[i, j] = pl.LpVariable(f"p_{i}_{j}", 0, 1, pl.LpBinary)
+        
+        # Inside/outside cells
+        self.inside = {}
+        for i in range(self.n_r):
+            for j in range(self.n_c):
+                self.inside[i, j] = pl.LpVariable(f"inside_{i}_{j}", 0, 1, pl.LpBinary)
+    
+    def _add_constraints(self):
+        """Add all constraints to the model."""
+        # Objective function (any valid solution is acceptable)
+        self.model += 0, "Empty objective"
+        
+        # Add constraints gradually to identify the source of infeasibility
+        print("Adding cycle constraints...")
+        self._add_cycle_constraints()
+        
+        # First try with just cycle constraints
+        result = self.model.solve(pl.PULP_CBC_CMD(msg=False))
+        if self.model.status != pl.LpStatusOptimal:
+            print("Model is infeasible with just cycle constraints!")
+            return
+        print("Model is feasible with cycle constraints.")
+        
+        # Add uncircled number constraints
+        print("Adding uncircled number constraints...")
+        self._add_uncircled_number_constraints()
+        
+        # Try solving with these constraints
+        result = self.model.solve(pl.PULP_CBC_CMD(msg=False))
+        if self.model.status != pl.LpStatusOptimal:
+            print("Model became infeasible after adding uncircled number constraints!")
+            return
+        print("Model is feasible with uncircled number constraints.")
+        
+        # Initialize inside/outside variables early
+        print("Adding inside/outside cell constraints...")
+        
+        # Choose a reference point known to be outside (we'll fix a point at the edge as "outside")
+        if self.n_r > 0 and self.n_c > 0:
+            # Fix the top-left cell as "outside" (reference point)
+            self.model += self.inside[0, 0] == 0, "Outside_Reference"
+        
+        # For each pair of adjacent cells, they must have the same inside/outside status if there's no fence between them
+        for i in range(self.n_r):
+            for j in range(self.n_c):
+                # Connect with cell to the right (if in bounds)
+                if j < self.n_c - 1:
+                    # If no vertical fence between cells (i,j) and (i,j+1), they have the same inside/outside status
+                    self.model += self.inside[i, j] - self.inside[i, j+1] <= self.v[i, j+1], f"Inside_Right_{i}_{j}"
+                    self.model += self.inside[i, j+1] - self.inside[i, j] <= self.v[i, j+1], f"Inside_Left_{i}_{j+1}"
+                
+                # Connect with cell below (if in bounds)
+                if i < self.n_r - 1:
+                    # If no horizontal fence between cells (i,j) and (i+1,j), they have the same inside/outside status
+                    self.model += self.inside[i, j] - self.inside[i+1, j] <= self.h[i+1, j], f"Inside_Down_{i}_{j}" 
+                    self.model += self.inside[i+1, j] - self.inside[i, j] <= self.h[i+1, j], f"Inside_Up_{i+1}_{j}"
+        
+        # Try solving with inside/outside variables
+        result = self.model.solve(pl.PULP_CBC_CMD(msg=False))
+        if self.model.status != pl.LpStatusOptimal:
+            print("Model became infeasible after adding inside/outside variables!")
+            return
+        print("Model is feasible with inside/outside variables.")
+        
+        # Add alien and triffid constraints - THIS IS THE KEY PART FOR DEFINING INSIDE VS OUTSIDE
+        print("Adding alien and triffid constraints...")
+        # Aliens must be inside the fence
+        for p, q in self.A:
+            # Values are 1-indexed in A
+            i, j = p-1, q-1
+            # Aliens MUST be INSIDE the fence (inside=1)
+            self.model += self.inside[i, j] == 1, f"Alien_Inside_{p}_{q}"
+        
+        # Triffids must be outside the fence
+        for p, q in self.T:
+            # Values are 1-indexed in T
+            i, j = p-1, q-1
+            # Triffids MUST be OUTSIDE the fence (inside=0)
+            self.model += self.inside[i, j] == 0, f"Triffid_Outside_{p}_{q}"
+        
+        # Check feasibility after alien/triffid constraints
+        result = self.model.solve(pl.PULP_CBC_CMD(msg=False))
+        if self.model.status != pl.LpStatusOptimal:
+            print("Model became infeasible after adding alien and triffid constraints!")
+            return
+        print("Model is feasible with alien and triffid constraints.")
+            
+        # Add circled number constraints
+        print("Adding circled number constraints...")
+        self._add_circled_number_constraints()
+        
+        # Try solving after circled number constraints
+        result = self.model.solve(pl.PULP_CBC_CMD(msg=False))
+        if self.model.status != pl.LpStatusOptimal:
+            print("Model became infeasible after adding circled number constraints!")
+            return
+        print("Model is feasible with circled number constraints.")
+        
+        # Try adding black circle constraints separately
+        print("Adding black circle constraints...")
+        self._add_black_circle_constraints()
+        
+        # Check feasibility after black circle constraints
+        result = self.model.solve(pl.PULP_CBC_CMD(msg=False))
+        if self.model.status != pl.LpStatusOptimal:
+            print("Model became infeasible after adding black circle constraints!")
+            return
+        print("Model is feasible with black circle constraints.")
+        
+        # Try adding white circle constraints separately
+        print("Adding white circle constraints...")
+        self._add_white_circle_constraints()
+        
+        # Final check
+        result = self.model.solve(pl.PULP_CBC_CMD(msg=False))
+        if self.model.status != pl.LpStatusOptimal:
+            print("Model became infeasible after adding white circle constraints!")
             return
         
-        h_fence = {}
-        v_fence = {}
-        inside = {}
-        
-        if solution:
-            h_fence_data = solution.get("h_fence", {})
-            v_fence_data = solution.get("v_fence", {})
-            inside_data = solution.get("inside", {})
+        print("All constraints added successfully. Model is feasible.")
+    
+    def _add_uncircled_number_constraints(self):
+        """Add constraints for uncircled numbers."""
+        for p, q in self.F:
+            # Values are 1-indexed in F
+            i, j = p-1, q-1
+            value = self.matrix_1[i][j]
             
-            # Convert string keys to tuples
-            for key, val in h_fence_data.items():
-                i, j = map(int, key.split(','))
-                h_fence[i, j] = val
+            # The sum of fence segments around this square must equal the value
+            self.model += (
+                self.h[i, j] + self.h[i+1, j] + 
+                self.v[i, j] + self.v[i, j+1] == value,
+                f"Uncircled_Number_{p}_{q}"
+            )
+    
+    def _add_circled_number_constraints(self):
+        """Add constraints for circled numbers."""
+        for p, q in self.K:
+            # Values are 1-indexed in K
+            i, j = p-1, q-1
+            value = self.matrix_1[i][j]["value"]
+            
+            # Circled numbers MUST be inside the fence (inside=1)
+            self.model += self.inside[i, j] == 1, f"Circled_Number_Inside_{p}_{q}"
+            
+            # Add visibility constraints - count visible squares in the 4 cardinal directions
+            # Create variables to count visible squares in each direction
+            visible_squares = []
+
+            # The circled number square itself is always visible (counted in the value)
+            visible_squares.append(1)  # Always count the center square itself
+            
+            # Check visibility to the north (negative i direction)
+            for di in range(i-1, -1, -1):
+                # Create a variable for visibility of this square
+                vis_var = pl.LpVariable(f"vis_N_{i}_{j}_{di}", 0, 1, pl.LpBinary)
                 
-            for key, val in v_fence_data.items():
-                i, j = map(int, key.split(','))
-                v_fence[i, j] = val
+                # Check for fence crossings between the circled number and this cell
+                fence_crossings = []
+                for k in range(di, i):
+                    fence_crossings.append(self.h[k, j])  # Horizontal fence segment crossing the line of sight
                 
-            for key, val in inside_data.items():
-                i, j = map(int, key.split(','))
-                inside[i, j] = val
+                # Square is visible if it's inside AND there are no fence crossings
+                max_crossings = pl.LpVariable(f"cross_N_{i}_{j}_{di}", 0, 1, pl.LpBinary)
+                if fence_crossings:
+                    self.model += pl.lpSum(fence_crossings) <= len(fence_crossings) * (1 - max_crossings), f"Cross_N_{i}_{j}_{di}"
+                    self.model += max_crossings <= 1 - (pl.lpSum(fence_crossings) / len(fence_crossings)), f"Cross_N2_{i}_{j}_{di}"
+                else:
+                    self.model += max_crossings == 1, f"Cross_N3_{i}_{j}_{di}"  # No fence crossings possible
+                    
+                # Square is visible if inside AND no fence crossings
+                self.model += vis_var <= self.inside[di, j], f"Vis_N_Inside_{i}_{j}_{di}"
+                self.model += vis_var <= max_crossings, f"Vis_N_Fence_{i}_{j}_{di}"
+                self.model += vis_var >= self.inside[di, j] + max_crossings - 1, f"Vis_N_Both_{i}_{j}_{di}"
+                
+                visible_squares.append(vis_var)
+            
+            # Check visibility to the south (positive i direction)
+            for di in range(i+1, self.n_r):
+                # Create a variable for visibility of this square
+                vis_var = pl.LpVariable(f"vis_S_{i}_{j}_{di}", 0, 1, pl.LpBinary)
+                
+                # Check for fence crossings between the circled number and this cell
+                fence_crossings = []
+                for k in range(i+1, di+1):
+                    fence_crossings.append(self.h[k, j])  # Horizontal fence segment crossing the line of sight
+                
+                # Square is visible if it's inside AND there are no fence crossings
+                max_crossings = pl.LpVariable(f"cross_S_{i}_{j}_{di}", 0, 1, pl.LpBinary)
+                if fence_crossings:
+                    self.model += pl.lpSum(fence_crossings) <= len(fence_crossings) * (1 - max_crossings), f"Cross_S_{i}_{j}_{di}"
+                    self.model += max_crossings <= 1 - (pl.lpSum(fence_crossings) / len(fence_crossings)), f"Cross_S2_{i}_{j}_{di}"
+                else:
+                    self.model += max_crossings == 1, f"Cross_S3_{i}_{j}_{di}"  # No fence crossings possible
+                    
+                # Square is visible if inside AND no fence crossings
+                self.model += vis_var <= self.inside[di, j], f"Vis_S_Inside_{i}_{j}_{di}"
+                self.model += vis_var <= max_crossings, f"Vis_S_Fence_{i}_{j}_{di}"
+                self.model += vis_var >= self.inside[di, j] + max_crossings - 1, f"Vis_S_Both_{i}_{j}_{di}"
+                
+                visible_squares.append(vis_var)
+            
+            # Check visibility to the east (positive j direction)
+            for dj in range(j+1, self.n_c):
+                # Create a variable for visibility of this square
+                vis_var = pl.LpVariable(f"vis_E_{i}_{j}_{dj}", 0, 1, pl.LpBinary)
+                
+                # Check for fence crossings between the circled number and this cell
+                fence_crossings = []
+                for k in range(j+1, dj+1):
+                    fence_crossings.append(self.v[i, k])  # Vertical fence segment crossing the line of sight
+                
+                # Square is visible if it's inside AND there are no fence crossings
+                max_crossings = pl.LpVariable(f"cross_E_{i}_{j}_{dj}", 0, 1, pl.LpBinary)
+                if fence_crossings:
+                    self.model += pl.lpSum(fence_crossings) <= len(fence_crossings) * (1 - max_crossings), f"Cross_E_{i}_{j}_{dj}"
+                    self.model += max_crossings <= 1 - (pl.lpSum(fence_crossings) / len(fence_crossings)), f"Cross_E2_{i}_{j}_{dj}"
+                else:
+                    self.model += max_crossings == 1, f"Cross_E3_{i}_{j}_{dj}"  # No fence crossings possible
+                    
+                # Square is visible if inside AND no fence crossings
+                self.model += vis_var <= self.inside[i, dj], f"Vis_E_Inside_{i}_{j}_{dj}"
+                self.model += vis_var <= max_crossings, f"Vis_E_Fence_{i}_{j}_{dj}"
+                self.model += vis_var >= self.inside[i, dj] + max_crossings - 1, f"Vis_E_Both_{i}_{j}_{dj}"
+                
+                visible_squares.append(vis_var)
+            
+            # Check visibility to the west (negative j direction)
+            for dj in range(j-1, -1, -1):
+                # Create a variable for visibility of this square
+                vis_var = pl.LpVariable(f"vis_W_{i}_{j}_{dj}", 0, 1, pl.LpBinary)
+                
+                # Check for fence crossings between the circled number and this cell
+                fence_crossings = []
+                for k in range(dj, j):
+                    fence_crossings.append(self.v[i, k])  # Vertical fence segment crossing the line of sight
+                
+                # Square is visible if it's inside AND there are no fence crossings
+                max_crossings = pl.LpVariable(f"cross_W_{i}_{j}_{dj}", 0, 1, pl.LpBinary)
+                if fence_crossings:
+                    self.model += pl.lpSum(fence_crossings) <= len(fence_crossings) * (1 - max_crossings), f"Cross_W_{i}_{j}_{dj}"
+                    self.model += max_crossings <= 1 - (pl.lpSum(fence_crossings) / len(fence_crossings)), f"Cross_W2_{i}_{j}_{dj}"
+                else:
+                    self.model += max_crossings == 1, f"Cross_W3_{i}_{j}_{dj}"  # No fence crossings possible
+                    
+                # Square is visible if inside AND no fence crossings
+                self.model += vis_var <= self.inside[i, dj], f"Vis_W_Inside_{i}_{j}_{dj}"
+                self.model += vis_var <= max_crossings, f"Vis_W_Fence_{i}_{j}_{dj}"
+                self.model += vis_var >= self.inside[i, dj] + max_crossings - 1, f"Vis_W_Both_{i}_{j}_{dj}"
+                
+                visible_squares.append(vis_var)
+            
+            # Total visibility is the sum of visible squares (including the circled number itself)
+            self.model += pl.lpSum(visible_squares) == value, f"Circled_Number_Visibility_{p}_{q}"
+            
+            print(f"Added visibility constraints for circled number {value} at ({p},{q})")
+    
+    def _add_cycle_constraints(self):
+        """Add constraints to ensure a valid cycle."""
+        # Each point on the fence has exactly 2 connected segments
+        for i in range(self.n_r+1):
+            for j in range(self.n_c+1):
+                # Left, right, up, down segments
+                segments = []
+                if j > 0:
+                    segments.append(self.h[i, j-1])  # Left
+                if j < self.n_c:
+                    segments.append(self.h[i, j])    # Right
+                if i > 0:
+                    segments.append(self.v[i-1, j])  # Up
+                if i < self.n_r:
+                    segments.append(self.v[i, j])    # Down
+                
+                # Either 0 or 2 segments must be connected to this point
+                self.model += (pl.lpSum(segments) == 2*self.p[i, j], f"Point_{i}_{j}")
+    
+    def _add_black_circle_constraints(self):
+        """Add constraints for black circles."""
+        print(f"Number of black circles: {len(self.B)}")
+        for i, j in self.B:
+            # Black circle requires a 90° turn and extends at least one segment in both directions
+            print(f"Adding strict constraints for black circle at ({i}, {j})")
+            
+            # For each black circle, identify possible segments
+            h_left = (i < self.n_r+1 and j > 0, self.h[i, j-1] if i < self.n_r+1 and j > 0 else None)
+            h_right = (i < self.n_r+1 and j < self.n_c, self.h[i, j] if i < self.n_r+1 and j < self.n_c else None)
+            v_up = (i > 0 and j < self.n_c+1, self.v[i-1, j] if i > 0 and j < self.n_c+1 else None)
+            v_down = (i < self.n_r and j < self.n_c+1, self.v[i, j] if i < self.n_r and j < self.n_c+1 else None)
+            
+            # Simplified approach: count available segments first
+            available_segments = []
+            if h_left[0]: available_segments.append(h_left[1])
+            if h_right[0]: available_segments.append(h_right[1])
+            if v_up[0]: available_segments.append(v_up[1])
+            if v_down[0]: available_segments.append(v_down[1])
+            
+            # The point must be on the fence
+            if available_segments:
+                self.model += pl.lpSum(available_segments) >= 2*self.p[i, j], f"Black_FencePoint_{i}_{j}"
+                # Either 0 or 2 segments must be connected (consistent with cycle constraints)
+                self.model += pl.lpSum(available_segments) <= 2, f"Black_Max2_{i}_{j}"
+            else:
+                print(f"Warning: Black circle at ({i}, {j}) has no available segments!")
+                continue
+            
+            # Check horizontal-vertical pairs for 90° turns
+            if h_left[0] and v_up[0]:
+                # If both segments used, extensions must exist
+                hv_corner = pl.LpVariable(f"hv1_{i}_{j}", 0, 1, pl.LpBinary)
+                self.model += h_left[1] + v_up[1] - 1 <= hv_corner, f"Black_HV1_Use_{i}_{j}"
+                
+                # If this corner is used, check for available extensions
+                if j > 1:  # Can extend left
+                    self.model += self.h[i, j-2] >= hv_corner, f"Black_HV1_ExtL_{i}_{j}"
+                if i > 1:  # Can extend up
+                    self.model += self.v[i-2, j] >= hv_corner, f"Black_HV1_ExtU_{i}_{j}"
+            
+            if h_left[0] and v_down[0]:
+                # If both segments used, extensions must exist
+                hv_corner = pl.LpVariable(f"hv2_{i}_{j}", 0, 1, pl.LpBinary)
+                self.model += h_left[1] + v_down[1] - 1 <= hv_corner, f"Black_HV2_Use_{i}_{j}"
+                
+                # If this corner is used, check for available extensions
+                if j > 1:  # Can extend left
+                    self.model += self.h[i, j-2] >= hv_corner, f"Black_HV2_ExtL_{i}_{j}"
+                if i+1 < self.n_r:  # Can extend down
+                    self.model += self.v[i+1, j] >= hv_corner, f"Black_HV2_ExtD_{i}_{j}"
+            
+            if h_right[0] and v_up[0]:
+                # If both segments used, extensions must exist
+                hv_corner = pl.LpVariable(f"hv3_{i}_{j}", 0, 1, pl.LpBinary)
+                self.model += h_right[1] + v_up[1] - 1 <= hv_corner, f"Black_HV3_Use_{i}_{j}"
+                
+                # If this corner is used, check for available extensions
+                if j+1 < self.n_c:  # Can extend right
+                    self.model += self.h[i, j+1] >= hv_corner, f"Black_HV3_ExtR_{i}_{j}"
+                if i > 1:  # Can extend up
+                    self.model += self.v[i-2, j] >= hv_corner, f"Black_HV3_ExtU_{i}_{j}"
+            
+            if h_right[0] and v_down[0]:
+                # If both segments used, extensions must exist
+                hv_corner = pl.LpVariable(f"hv4_{i}_{j}", 0, 1, pl.LpBinary)
+                self.model += h_right[1] + v_down[1] - 1 <= hv_corner, f"Black_HV4_Use_{i}_{j}"
+                
+                # If this corner is used, check for available extensions
+                if j+1 < self.n_c:  # Can extend right
+                    self.model += self.h[i, j+1] >= hv_corner, f"Black_HV4_ExtR_{i}_{j}"
+                if i+1 < self.n_r:  # Can extend down
+                    self.model += self.v[i+1, j] >= hv_corner, f"Black_HV4_ExtD_{i}_{j}"
+    
+    def _add_white_circle_constraints(self):
+        """Add constraints for white circles."""
+        print(f"Number of white circles: {len(self.W)}")
+        for i, j in self.W:
+            # White circle requires a straight passage with turn immediately after on at least one end
+            print(f"Adding strict constraints for white circle at ({i}, {j})")
+            
+            # Identify possible straight passages through this point
+            h_passage = (i < self.n_r+1 and j > 0 and j < self.n_c, 
+                        (self.h[i, j-1], self.h[i, j]) if i < self.n_r+1 and j > 0 and j < self.n_c else (None, None))
+            
+            v_passage = (i > 0 and i < self.n_r and j < self.n_c+1,
+                        (self.v[i-1, j], self.v[i, j]) if i > 0 and i < self.n_r and j < self.n_c+1 else (None, None))
+            
+            # Create binary variables for the two possible passage types
+            horiz = pl.LpVariable(f"w_horiz_{i}_{j}", 0, 1, pl.LpBinary)
+            vert = pl.LpVariable(f"w_vert_{i}_{j}", 0, 1, pl.LpBinary)
+            
+            # The point must be on the fence
+            self.model += horiz + vert == self.p[i, j], f"White_OnFence_{i}_{j}"
+            
+            # Set up constraints for horizontal passage
+            if h_passage[0]:
+                # Both horizontal segments must be used if horiz is 1
+                self.model += h_passage[1][0] + h_passage[1][1] >= 2 * horiz, f"White_H_Pass1_{i}_{j}"
+                self.model += h_passage[1][0] <= horiz, f"White_H_Pass2_{i}_{j}"
+                self.model += h_passage[1][1] <= horiz, f"White_H_Pass3_{i}_{j}"
+                
+                # Check for possible turns at left end (j-1)
+                left_turns = []
+                if j-1 >= 0:
+                    if i > 0:  # Can turn up
+                        left_turns.append(self.v[i-1, j-1])
+                    if i < self.n_r:  # Can turn down
+                        left_turns.append(self.v[i, j-1])
+                
+                # Check for turns at right end (j+1)
+                right_turns = []
+                if j+1 <= self.n_c:
+                    if i > 0:  # Can turn up
+                        right_turns.append(self.v[i-1, j+1])
+                    if i < self.n_r:  # Can turn down
+                        right_turns.append(self.v[i, j+1])
+                
+                # At least one turn must exist on either end if horizontal passage is used
+                if left_turns or right_turns:
+                    turns = left_turns + right_turns
+                    if turns:
+                        # If horizontal passage is used, at least one turn must exist
+                        self.model += pl.lpSum(turns) >= horiz, f"White_H_Turns_{i}_{j}"
+                else:
+                    # No turns possible for horizontal passage - can't use this orientation
+                    self.model += horiz == 0, f"White_H_Disabled_{i}_{j}"
+            else:
+                # Horizontal passage not available
+                self.model += horiz == 0, f"White_H_NotAvail_{i}_{j}"
+            
+            # Set up constraints for vertical passage
+            if v_passage[0]:
+                # Both vertical segments must be used if vert is 1
+                self.model += v_passage[1][0] + v_passage[1][1] >= 2 * vert, f"White_V_Pass1_{i}_{j}"
+                self.model += v_passage[1][0] <= vert, f"White_V_Pass2_{i}_{j}"
+                self.model += v_passage[1][1] <= vert, f"White_V_Pass3_{i}_{j}"
+                
+                # Check for turns at top end (i-1)
+                top_turns = []
+                if i-1 >= 0:
+                    if j > 0:  # Can turn left
+                        top_turns.append(self.h[i-1, j-1])
+                    if j < self.n_c:  # Can turn right
+                        top_turns.append(self.h[i-1, j])
+                
+                # Check for turns at bottom end (i+1)
+                bottom_turns = []
+                if i+1 <= self.n_r:
+                    if j > 0:  # Can turn left
+                        bottom_turns.append(self.h[i+1, j-1])
+                    if j < self.n_c:  # Can turn right
+                        bottom_turns.append(self.h[i+1, j])
+                
+                # At least one turn must exist on either end if vertical passage is used
+                if top_turns or bottom_turns:
+                    turns = top_turns + bottom_turns
+                    if turns:
+                        # If vertical passage is used, at least one turn must exist
+                        self.model += pl.lpSum(turns) >= vert, f"White_V_Turns_{i}_{j}"
+                else:
+                    # No turns possible for vertical passage - can't use this orientation
+                    self.model += vert == 0, f"White_V_Disabled_{i}_{j}"
+            else:
+                # Vertical passage not available
+                self.model += vert == 0, f"White_V_NotAvail_{i}_{j}"
+    
+    def _find_loops(self, h_sol, v_sol):
+        """Find all loops in the current solution."""
+        # Create a graph from the solution
+        graph = {}
+        for i in range(self.n_r+1):
+            for j in range(self.n_c+1):
+                graph[(i, j)] = []
+        
+        # Add horizontal edges
+        for i in range(self.n_r+1):
+            for j in range(self.n_c):
+                if h_sol.get((i, j), 0) > 0.5:
+                    graph[(i, j)].append((i, j+1))
+                    graph[(i, j+1)].append((i, j))
+        
+        # Add vertical edges
+        for i in range(self.n_r):
+            for j in range(self.n_c+1):
+                if v_sol.get((i, j), 0) > 0.5:
+                    graph[(i, j)].append((i+1, j))
+                    graph[(i+1, j)].append((i, j))
+        
+        # Find all loops using DFS
+        visited = set()
+        loops = []
+        
+        # Find all nodes that are part of the graph (have edges)
+        active_nodes = []
+        for node, neighbors in graph.items():
+            if neighbors:
+                active_nodes.append(node)
+        
+        # For each unvisited node with edges, try to find a loop
+        for start_node in active_nodes:
+            if start_node in visited:
+                continue
+            
+            # Start DFS from this node
+            stack = [(start_node, None)]  # (node, parent)
+            path = {}  # Maps node to its parent in the DFS tree
+            
+            while stack:
+                node, parent = stack.pop()
+                
+                if node in path:
+                    # We found a cycle
+                    # Reconstruct the cycle
+                    cycle = []
+                    
+                    # From the current node back to where it was first visited
+                    current = parent
+                    while current != node and current is not None:
+                        cycle.append(current)
+                        current = path.get(current)
+                        if current is None:
+                            # This shouldn't happen in a valid cycle
+                            break
+                    
+                    # Only add valid cycles
+                    if current == node and len(cycle) >= 3:
+                        cycle.append(node)
+                        cycle.reverse()  # Get the correct order
+                        loops.append(cycle)
+                    
+                    # Mark all nodes in the cycle as visited
+                    for n in cycle:
+                        visited.add(n)
+                    
+                    continue
+                
+                # Mark node as visited in the current DFS path
+                path[node] = parent
+                
+                # Explore neighbors
+                for neighbor in graph[node]:
+                    if neighbor != parent:  # Avoid going back to parent
+                        stack.append((neighbor, node))
+        
+        return loops
+    
+    def visualize_solution(self, output_path=None):
+        """Visualize the solution."""
+        if self.solution is None:
+            print("No solution to visualize.")
+            return
+        
+        # Create a figure
+        fig, ax = plt.subplots(figsize=(10, 10))
+        
+        # Draw the grid
+        for i in range(self.n_r+1):
+            ax.axhline(i, color='gray', linestyle=':')
+        for j in range(self.n_c+1):
+            ax.axvline(j, color='gray', linestyle=':')
+        
+        # Get inside/outside status for each cell
+        inside_status = {}
+        for i in range(self.n_r):
+            for j in range(self.n_c):
+                inside_status[(i, j)] = pl.value(self.inside.get((i, j), 0)) > 0.5
+        
+        # Color regions - Use distinct colors to clearly identify inside vs outside
+        for i in range(self.n_r):
+            for j in range(self.n_c):
+                if inside_status.get((i, j), False):
+                    # Inside (value=1) - BLUE color
+                    ax.add_patch(plt.Rectangle((j, i), 1, 1, facecolor='lightblue', alpha=0.4))
+                else:
+                    # Outside (value=0) - YELLOW color
+                    ax.add_patch(plt.Rectangle((j, i), 1, 1, facecolor='lightyellow', alpha=0.3))
+        
+        # Draw the fence
+        h_sol = self.solution["h"]
+        v_sol = self.solution["v"]
+        
+        # Horizontal segments
+        for (i, j), val in h_sol.items():
+            if val > 0.5:
+                ax.plot([j, j+1], [i, i], 'k-', linewidth=3)
+        
+        # Vertical segments
+        for (i, j), val in v_sol.items():
+            if val > 0.5:
+                ax.plot([j, j], [i, i+1], 'k-', linewidth=3)
+        
+        # Draw special cells
+        for i in range(self.n_r):
+            for j in range(self.n_c):
+                cell = self.matrix_1[i][j]
+                if cell == "A":  # Alien
+                    is_inside = inside_status.get((i, j), False)
+                    status_text = "IN" if is_inside else "OUT"
+                    ax.text(j+0.5, i+0.5, f"👽\n{status_text}", fontsize=12, ha='center', va='center')
+                    # Add highlight for aliens
+                    ax.add_patch(plt.Circle((j+0.5, i+0.5), 0.4, fill=False, edgecolor='blue', linestyle='--', linewidth=1.5))
+                elif cell == "C":  # Triffid (Cactus)
+                    is_inside = inside_status.get((i, j), False)
+                    status_text = "IN" if is_inside else "OUT"
+                    ax.text(j+0.5, i+0.5, f"🌵\n{status_text}", fontsize=12, ha='center', va='center')
+                    # Add highlight for triffids
+                    ax.add_patch(plt.Circle((j+0.5, i+0.5), 0.4, fill=False, edgecolor='green', linestyle='--', linewidth=1.5))
+                elif isinstance(cell, dict) and cell.get("circled"):  # Circled number
+                    is_inside = inside_status.get((i, j), False)
+                    status_text = "IN" if is_inside else "OUT"
+                    ax.add_patch(plt.Circle((j+0.5, i+0.5), 0.3, fill=False, edgecolor='red', linewidth=1.5))
+                    ax.text(j+0.5, i+0.5, f"{cell['value']}\n{status_text}", fontsize=10, ha='center', va='center')
+                elif isinstance(cell, int):  # Uncircled number
+                    ax.text(j+0.5, i+0.5, str(cell), fontsize=10, ha='center', va='center')
+        
+        # Draw special points with enhanced visibility
+        for i in range(len(self.matrix_2)):
+            for j in range(len(self.matrix_2[0])):
+                point = self.matrix_2[i][j]
+                if point == "E":  # White circle
+                    ax.add_patch(plt.Circle((j, i), 0.2, facecolor='white', edgecolor='black', linewidth=2, zorder=10))
+                elif point == "F":  # Black circle
+                    ax.add_patch(plt.Circle((j, i), 0.2, facecolor='black', edgecolor='white', linewidth=1, zorder=10))
+        
+        # Add legend
+        ax.add_patch(plt.Rectangle((0, -0.5), 0.3, 0.3, facecolor='lightblue', alpha=0.4))
+        ax.text(0.4, -0.35, "Inside fence", fontsize=10, va='center')
+        ax.add_patch(plt.Rectangle((2, -0.5), 0.3, 0.3, facecolor='lightyellow', alpha=0.3))
+        ax.text(2.4, -0.35, "Outside fence", fontsize=10, va='center')
+        
+        # Set limits and invert y-axis
+        ax.set_xlim(-0.5, self.n_c+0.5)
+        ax.set_ylim(self.n_r+0.5, -0.8)  # Extended to show legend
+        ax.set_aspect('equal')
+        ax.axis('off')
+        
+        # Add title with puzzle info
+        ax.set_title(f"Area51 Puzzle: {os.path.basename(self.puzzle_path)}\nAliens must be INSIDE (blue), Triffids must be OUTSIDE (yellow)", 
+                    fontsize=12, pad=10)
+        
+        # Save or show
+        if output_path:
+            plt.savefig(output_path)
         else:
-            # Extract from model variables
-            for i in range(self.rows + 1):
-                for j in range(self.cols):
-                    if self.h_fence[i, j].X > 0.5:
-                        h_fence[i, j] = 1
-            
-            for i in range(self.rows):
-                for j in range(self.cols + 1):
-                    if self.v_fence[i, j].X > 0.5:
-                        v_fence[i, j] = 1
-            
-            for i in range(self.rows):
-                for j in range(self.cols):
-                    if self.inside[i, j].X > 0.5:
-                        inside[i, j] = 1
-        
-        # Display the solution
-        print("\nSolution:")
-        print("=" * (self.cols * 2 + 1))
-        
-        for i in range(self.rows):
-            # Print horizontal edges above this row
-            h_line = ""
-            for j in range(self.cols):
-                h_line += "+" + (" " if (i, j) not in h_fence else "-")
-            h_line += "+"
-            print(h_line)
-            
-            # Print vertical edges and cells
-            v_line = ""
-            for j in range(self.cols):
-                v_line += (" " if (i, j) not in v_fence else "|")
-                
-                # Print cell content
-                cell_content = " "
-                if self.matrix_1[i][j] is not None:
-                    if isinstance(self.matrix_1[i][j], dict) and self.matrix_1[i][j].get("circled"):
-                        cell_content = str(self.matrix_1[i][j]["value"]) + "⭘"
-                    elif self.matrix_1[i][j] == "A":
-                        cell_content = "A"
-                    elif self.matrix_1[i][j] == "C":
-                        cell_content = "C"
-                    else:
-                        cell_content = str(self.matrix_1[i][j])
-                
-                # Mark inside/outside
-                if (i, j) in inside:
-                    # If no specific content, show inside mark
-                    if cell_content == " ":
-                        cell_content = "I"
-                
-                v_line += cell_content
-            
-            # Print the last vertical edge
-            v_line += (" " if (i, self.cols) not in v_fence else "|")
-            print(v_line)
-        
-        # Print the bottom horizontal edges
-        h_line = ""
-        for j in range(self.cols):
-            h_line += "+" + (" " if (self.rows, j) not in h_fence else "-")
-        h_line += "+"
-        print(h_line)
-        
-        print("=" * (self.cols * 2 + 1))
+            plt.show()
+
+def solve_area51_puzzle(puzzle_path):
+    """Solve an Area51 puzzle from a JSON file."""
+    solver = Area51Solver(puzzle_path)
+    if solver.solve():
+        return solver
+    return None
+
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) > 1:
+        puzzle_path = sys.argv[1]
+        solver = solve_area51_puzzle(puzzle_path)
+        if solver:
+            solver.visualize_solution()
+    else:
+        print("Usage: python area51.py <puzzle_json_path>")

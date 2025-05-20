@@ -1,0 +1,31 @@
+{
+    "matrix_1": [
+        [null, null, 3, null, null, null, null, null, 1, null, null, null, null, null, null],
+        [null, null, null, 1, null, null, null, null, 1, "A", null, null, null, null, null],
+        [null, null, 3, null, null, 2, null, null, null, null, null, null, null, 1, 2],
+        [2, null, null, null, null, null, null, null, null, 3, null, 2, null, 2, null],
+        [null, null, null, null, null, null, null, null, null, null, 2, null, null, 3, null],
+        [2, "C", null, null, null, 2, null, 2, null, null, null, null, null, null, null],
+        [null, null, null, null, null, null, null, null, null, null, null, null, "A", 3, null],
+        [null, null, null, null, 3, null, null, null, 2, {"value": 9, "circled": true}, 3, null, null, null, null],
+        [null, 3, null, null, null, null, null, null, 2, null, null, 2, 2, null, null],
+        [2, null, null, null, 2, null, null, 2, null, null, null, null, null, 2, null],
+        [null, 3, null, null, null, null, null, null, null, null, null, null, 3, null, null],
+        [null, 2, null, null, 2, null, 3, null, 2, null, null, null, null, null, null]
+    ],
+    "matrix_2": [
+        [null, null, null, null, null, null, null, null, null, null, null, "F", "E", null, null, null],
+        [null, "E", null, null, "E", null, "E", null, "F", null, null, null, null, "E", "E", null],
+        [null, null, null, null, null, null, null, "F", null, null, null, null, null, null, null, null],
+        [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
+        [null, null, null, null, "F", null, null, null, null, null, null, null, null, "E", null, null],
+        [null, "E", "E", "E", null, null, null, "E", null, null, null, null, null, null, null, null],
+        [null, null, null, null, null, null, null, null, null, "E", null, null, null, null, "E", null],
+        [null, null, "F", null, null, null, null, null, null, null, null, null, null, null, null, null],
+        [null, null, null, null, null, "E", "E", null, null, null, null, null, null, null, "E", null],
+        [null, null, null, "E", null, null, null, null, null, null, null, null, null, null, "E", null],
+        [null, null, null, null, null, null, "E", null, null, null, "E", null, null, null, null, null],
+        [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
+        [null, null, null, null, null, "E", null, null, "E", null, null, null, null, null, "E", null]
+    ]
+}
